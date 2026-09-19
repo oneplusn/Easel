@@ -54,10 +54,13 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import importlib.util
 import json
 import logging
 import os
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -279,6 +282,86 @@ def _extract_text(result: Any) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# 常驻事件循环 + 会话级 Agent 缓存
+# --------------------------------------------------------------------------- #
+# 为什么需要这两样（2026-09-19 真机验证实测出来的，不是预防性设计）：
+#
+# 1) **常驻事件循环**：openJiuwen 的 LLM 客户端与会话状态绑在"创建它的那个事件循环"
+#    上。基类 ``run_sync`` 每轮 ``asyncio.run`` 都新建循环，第二轮直接
+#    ``RuntimeError: Event loop is closed``，多轮对话根本走不到第二步。
+# 2) **按会话复用 Agent**：Runner 的 in-memory checkpointer store 是按 **agent 实例**
+#    建的（日志里的 ``agent_id``）。每轮 ``ReActAgent(...)`` 都是新实例 → 历史永远为空，
+#    表现为"上一轮刚说过的名字，下一轮就忘了"。
+#
+# 两者一起才是"多轮对话"。只做其一都不行：
+#   复用实例 + 换循环 → Event loop is closed；
+#   不换循环 + 不复用 → 失忆。
+#
+# 因此：**同步路径**（CLI 的 chat/skill、web 非流式）统一提交到下面这个常驻循环，
+# 并按 ``session_id`` 复用同一个 Agent。异步路径（web 流式）跑在调用方自己的循环上，
+# 不碰这个缓存——否则会拿到别的循环上建出来的 Agent，直接崩。
+_LOOP_LOCK = threading.Lock()
+_LOOP: asyncio.AbstractEventLoop | None = None
+_LOOP_THREAD: threading.Thread | None = None
+
+#: session_id → (配置指纹, ReActAgent)。指纹不同就不复用：
+#: 同一个 session_key 换了模型/prompt 时，必须重建 Agent，否则新配置不生效。
+#: （这条不是预防性设计：单测里同一个 ``session_key="s"`` 会换不同 MODEL_NAME 跑。）
+_AGENTS: "OrderedDict[str, tuple[tuple, Any]]" = OrderedDict()
+_MAX_CACHED_AGENTS = 32
+
+
+def _get_persistent_loop() -> asyncio.AbstractEventLoop:
+    """取（必要时创建）常驻事件循环。它跑在一个 daemon 线程里，随进程退出。"""
+    global _LOOP, _LOOP_THREAD
+    with _LOOP_LOCK:
+        if _LOOP is None or _LOOP.is_closed():
+            loop = asyncio.new_event_loop()
+            thread = threading.Thread(
+                target=loop.run_forever, name="easel-openjiuwen-loop", daemon=True
+            )
+            thread.start()
+            _LOOP, _LOOP_THREAD = loop, thread
+            logger.info("[harness.openjiuwen] 常驻事件循环已启动（多轮会话需要它）")
+        return _LOOP
+
+
+def _on_persistent_loop() -> bool:
+    """当前协程是不是跑在常驻循环上（是才允许用 agent 缓存）。"""
+    if _LOOP is None:
+        return False
+    try:
+        return asyncio.get_running_loop() is _LOOP
+    except RuntimeError:
+        return False
+
+
+def _take_cached_agent(session_id: str, fingerprint: tuple) -> Any | None:
+    """取本会话的 Agent；配置指纹对得上才复用，否则视为未命中（等重建）。"""
+    entry = _AGENTS.get(session_id)
+    if entry is None:
+        return None
+    cached_fp, agent = entry
+    if cached_fp != fingerprint:
+        _AGENTS.pop(session_id, None)
+        return None
+    _AGENTS.move_to_end(session_id)
+    return agent
+
+
+def _remember_agent(session_id: str, fingerprint: tuple, agent: Any) -> None:
+    _AGENTS[session_id] = (fingerprint, agent)
+    _AGENTS.move_to_end(session_id)
+    while len(_AGENTS) > _MAX_CACHED_AGENTS:
+        _AGENTS.popitem(last=False)
+
+
+def release_session(session_id: str) -> None:
+    """丢掉某个会话的 Agent（会话结束/换后端时用；不丢也不影响正确性，只是占内存）。"""
+    _AGENTS.pop(session_id, None)
+
+
+# --------------------------------------------------------------------------- #
 # harness
 # --------------------------------------------------------------------------- #
 class OpenJiuwenHarness(AgentHarness):
@@ -385,20 +468,34 @@ class OpenJiuwenHarness(AgentHarness):
         if spec.cwd:
             system_prompt = f"{system_prompt}\n当前工作目录：{spec.cwd}\n"
 
-        agent = ReActAgent(card=AgentCard(name="easel", description="Easel agent"))
-        config = (
-            ReActAgentConfig()
-            .configure_model_client(
-                provider=model["provider"],
-                api_key=model["api_key"],
-                api_base=model["api_base"],
-                model_name=model["model_name"],
-                verify_ssl=model["verify_ssl"],
-            )
-            .configure_prompt_template([{"role": "system", "content": system_prompt}])
-            .configure_max_iterations(model["max_iterations"])
+        # 会话复用（多轮对话的关键，见文件上方说明）：仅常驻循环上复用，
+        # 异步路径（web 流式）跑在调用方自己的循环上，不复用、也不入缓存。
+        fingerprint = (
+            model["provider"], model["model_name"], model["api_key"], model["api_base"],
+            model["verify_ssl"], model["max_iterations"], model["stateless"], system_prompt,
+            model["streaming"],
         )
-        agent.configure(config)
+        reusable = _on_persistent_loop()
+        agent = _take_cached_agent(session_id, fingerprint) if reusable else None
+        if agent is not None:
+            logger.info("[harness.openjiuwen] 复用会话 %s 的既有 Agent", session_id)
+        else:
+            agent = ReActAgent(card=AgentCard(name="easel", description="Easel agent"))
+            config = (
+                ReActAgentConfig()
+                .configure_model_client(
+                    provider=model["provider"],
+                    api_key=model["api_key"],
+                    api_base=model["api_base"],
+                    model_name=model["model_name"],
+                    verify_ssl=model["verify_ssl"],
+                )
+                .configure_prompt_template([{"role": "system", "content": system_prompt}])
+                .configure_max_iterations(model["max_iterations"])
+            )
+            agent.configure(config)
+            if reusable:
+                _remember_agent(session_id, fingerprint, agent)
 
         inputs: dict[str, Any] = {"query": spec.message}
         if not model["stateless"]:
@@ -514,6 +611,30 @@ class OpenJiuwenHarness(AgentHarness):
             )
             return "", usage, False
         return "".join(parts), usage, bool(parts)
+
+    def run_sync(
+        self,
+        spec: RunSpec,
+        *,
+        on_event=None,
+        on_permission=None,
+    ) -> RunResult:
+        """同步跑一轮——**提交到常驻事件循环**，而不是 ``asyncio.run``。
+
+        基类默认实现每轮新建事件循环，会让同一会话的第二轮报
+        ``RuntimeError: Event loop is closed``（多轮对话直接断）。这里统一
+        复用常驻循环，配合会话级 Agent 缓存，多轮上下文才能续上。
+        """
+        loop = _get_persistent_loop()
+        future = asyncio.run_coroutine_threadsafe(
+            self.run(spec, on_event=on_event, on_permission=on_permission),
+            loop,
+        )
+        try:
+            return future.result(timeout=float(spec.timeout_s) + 60.0)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise HarnessError(f"本轮超时（{spec.timeout_s}s）") from exc
 
     def ask_supported(self) -> bool:
         """openJiuwen 最小版本还没接结构化问答卡片。"""

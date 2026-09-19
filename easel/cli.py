@@ -21,6 +21,7 @@ from easel.commands.doctor import cmd_doctor
 from easel.commands.gateway import cmd_gateway
 from easel.commands.ping import cmd_ping
 from easel.commands.skill import cmd_skill
+from easel.harness import HarnessError, RunSpec, get_harness
 from easel.openclaw_cmd import openclaw_base_cmd
 from easel.persona import list_personas as _list_personas
 from easel.persona import persona_prefix
@@ -72,6 +73,62 @@ def _build_chat_cmd(session_key: str, message_prefix: str = "") -> list[str]:
     if message_prefix:
         cmd += ["--message", message_prefix]
     return cmd
+
+
+def _chat_turn(harness, session_key: str, message: str) -> tuple[bool, str]:
+    """用当前 harness 跑一轮对话，返回 (是否成功, 文本或错误信息)。
+
+    与 `easel skill` / `web /api/chat` 共用同一条 harness 路径：换后端只改
+    ``EASEL_HARNESS``，本函数不动。
+    """
+    spec = RunSpec(
+        message=message,
+        session_key=session_key,
+        cwd=PROJECT_ROOT,
+        timeout_s=float(TIMEOUT_CHAT),
+        env=_proxy_env(),
+    )
+    try:
+        result = harness.run_sync(spec)
+    except HarnessError as exc:
+        return False, str(exc)
+    except Exception as exc:  # noqa: BLE001 兜底：单轮异常不该掀翻整个 REPL
+        return False, f"{type(exc).__name__}: {exc}"
+    return True, result.text or ""
+
+
+def _chat_repl(harness, session_key: str, prefix: str) -> int:
+    """默认后端（openjiuwen）下的交互循环：同进程内按 session_key 续会话。"""
+    if not harness.health():
+        print(f"{RED}当前 harness '{harness.name}' 不可用{NC} — 请先装好依赖："
+              f"pip install -U openjiuwen；或运行 `python -m easel doctor` 检查环境。",
+              file=sys.stderr)
+        return 1
+
+    print(f"  {DIM}直接输入即对话；/session 查看会话，/quit 退出{NC}")
+    print()
+    while True:
+        try:
+            user_input = input(f"{CYAN}你{NC} › ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not user_input:
+            continue
+        if user_input in ("/quit", "/exit", "/q"):
+            return 0
+        if user_input == "/session":
+            print(f"  {DIM}会话: {session_key}"
+                  f"（session_id {harness.session_id_for(session_key)}）{NC}")
+            continue
+        # 画像随每条消息内联注入：与 web/skill 同源，保证「每个请求自包含」。
+        ok, text = _chat_turn(harness, session_key, f"{prefix}{user_input}")
+        if not ok:
+            print(f"{RED}{text}{NC}", file=sys.stderr)
+            continue
+        print()
+        print(text)
+        print()
 
 
 def cmd_chat(_args) -> int:
@@ -129,17 +186,29 @@ def cmd_chat(_args) -> int:
     print()
 
     prefix = persona_prefix(selected_persona)
+
+    # 后端由 EASEL_HARNESS 决定（默认 openjiuwen；openclaw 保留为可显式选用的回退）。
+    # 与 skill / web 是同一套开关——chat 不再是唯一还硬绑 openclaw 的入口。
     try:
-        # openclaw_base_cmd() 在 openclaw 全装不上时抛 FileNotFoundError；
-        # subprocess.run 在可执行文件缺失时同样抛 FileNotFoundError。两者都提示安装。
-        cmd = _build_chat_cmd(session_key, prefix)
-        result = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=_proxy_env())
-    except FileNotFoundError:
-        print(f"{RED}未找到 openclaw{NC} — 请先安装：npm i -g openclaw，"
-              f"或运行 `python -m easel doctor` 检查环境。", file=sys.stderr)
+        harness = get_harness()
+    except HarnessError as exc:
+        print(f"{RED}{exc}{NC}", file=sys.stderr)
         return 1
 
-    return result.returncode
+    if harness.name == "openclaw":
+        # 回退后端：沿用 openclaw tui（自带 TUI，含 /session 等交互命令）
+        try:
+            # openclaw_base_cmd() 在 openclaw 全装不上时抛 FileNotFoundError；
+            # subprocess.run 在可执行文件缺失时同样抛 FileNotFoundError。两者都提示安装。
+            cmd = _build_chat_cmd(session_key, prefix)
+            result = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=_proxy_env())
+        except FileNotFoundError:
+            print(f"{RED}未找到 openclaw{NC} — 请先安装：npm i -g openclaw，"
+                  f"或运行 `python -m easel doctor` 检查环境。", file=sys.stderr)
+            return 1
+        return result.returncode
+
+    return _chat_repl(harness, session_key, prefix)
 
 
 def cmd_web(args) -> int:
