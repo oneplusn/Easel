@@ -19,6 +19,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from easel.memory import ensure_memory_server
+
 # 项目根目录（Easel/）
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -240,10 +242,17 @@ def cmd_doctor(_args) -> int:
         if _memory_service_healthy(port):
             _check(f"记忆服务 /health (127.0.0.1:{port})", True)
         else:
-            _warn(
-                f"记忆服务 /health (127.0.0.1:{port})",
-                f"未在监听——启动：memory-server（或 easel 侧按需拉起）；.env 里 PORT={port}",
-            )
+            # 按需拉起：不再要求用户自己另开终端起 memory-server
+            # （注意 .env 里的 PORT 会覆盖脚本传参，所以端口一律从 .env 读）
+            started, detail = ensure_memory_server(port=port)
+            if started:
+                _check(f"记忆服务 /health (127.0.0.1:{port})", True)
+                print(f"    · {detail}")
+            else:
+                _warn(
+                    f"记忆服务 /health (127.0.0.1:{port})",
+                    f"未在监听——{detail}；.env 里 PORT={port}",
+                )
 
     # 5. Python 运行依赖
     for module in ("fastapi", "uvicorn", "sse_starlette", "multipart"):
