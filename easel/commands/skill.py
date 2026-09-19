@@ -1,7 +1,7 @@
-"""easel skill — 运行 SKILL，统一通过 OpenClaw agent 处理。
+"""easel skill — 运行 SKILL，统一通过当前 harness 处理。
 
-所有 SKILL 请求都发给 OpenClaw agent，由 OpenClaw 根据 AGENTS.md 的规则
-读对应 SKILL 自己执行、并凝练 Profile。
+所有 SKILL 请求都发给 harness 后面的 Agent（默认 openjiuwen；`EASEL_HARNESS=openclaw`
+可切回回退后端），由它按项目规则读对应 SKILL 自己执行、并凝练 Profile。
 这样无论从 chat / skill / web 哪个入口进来，逻辑都是一致的。
 
 用法：
@@ -13,20 +13,17 @@
 from __future__ import annotations
 
 import os
-import re
-import subprocess
 import sys
 import time
 from pathlib import Path
 
-from easel.openclaw_cmd import openclaw_base_cmd
+from easel.harness import HarnessError, RunSpec, get_harness
 from easel.persona import persona_prefix, profile_exists
 from easel.timeouts import TIMEOUT_PRODUCE
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SKILLS_DIR = PROJECT_ROOT / "skills" / "openclaw"
 PROFILES_DIR = PROJECT_ROOT / "profiles"
-OPENCLAW_PROFILE = "easel"
 
 
 def _list_all_skills() -> list[str]:
@@ -95,49 +92,39 @@ def _proxy_env() -> dict[str, str]:
     return env
 
 
-def _run_via_openclaw(message: str, timeout: int = 300) -> int:
-    """统一通过 OpenClaw agent 执行。"""
-    session_key = f"skill-{int(time.time() * 1000)}"
+def _run_via_harness(message: str, timeout: int = 300) -> int:
+    """统一通过当前 harness 跑一轮。
 
-    cmd = openclaw_base_cmd() + [
-        "--profile", OPENCLAW_PROFILE,
-        "agent", "--agent", "main",
-        "--session-key", f"agent:main:{session_key}",
-        "--timeout", str(timeout),
-        "--message", message,
-    ]
-
+    后端由 ``EASEL_HARNESS`` 决定（默认 ``openjiuwen``）；OpenClaw 保留为可显式选用的回退。
+    """
+    harness = get_harness()
+    spec = RunSpec(
+        message=message,
+        session_key=f"skill-{int(time.time() * 1000)}",
+        cwd=PROJECT_ROOT,
+        timeout_s=float(timeout),
+        env=_proxy_env(),
+    )
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                cwd=str(PROJECT_ROOT), timeout=timeout + 30,
-                                env=_proxy_env())
-    except subprocess.TimeoutExpired:
-        print("⏱️ 请求超时", file=sys.stderr)
-        return 124
+        result = harness.run_sync(spec)
+    except HarnessError as e:
+        text = str(e)
+        if "超时" in text or "timeout" in text.lower():
+            print("⏱️ 请求超时", file=sys.stderr)
+            return 124
+        print(f"❌ {text}", file=sys.stderr)
+        return 1
     except Exception as e:  # noqa: BLE001 — 兜底，避免裸崩堆栈（与 web 行为一致）
         print(f"❌ {e}", file=sys.stderr)
         return 1
 
-    if result.stdout:
-        lines = []
-        for line in result.stdout.splitlines():
-            clean = re.sub(r'\x1b\[[0-9;]*m', '', line)
-            if clean.startswith("[") and any(
-                tag in clean[:40] for tag in
-                ["[provider-", "[agents/", "[agent/", "[plugins]", "[tools]",
-                 "[diagnostic]", "[fetch-", "[heartbeat]", "[health-", "[gateway]"]
-            ):
-                continue
-            if clean.strip():
-                lines.append(clean)
-        output = "\n".join(lines).strip()
-        if output:
-            print(output)
+    if result.text:
+        print(result.text)
+    return 0 if result.returncode in (None, 0) else int(result.returncode)
 
-    if result.stderr:
-        print(result.stderr, file=sys.stderr)
 
-    return result.returncode
+#: 兼容旧入口名（v0.2.x 之前只支持 OpenClaw）
+_run_via_openclaw = _run_via_harness
 
 
 def cmd_skill(args) -> int:
@@ -155,7 +142,7 @@ def cmd_skill(args) -> int:
     if args.profile and not _check_profile_exists(args.profile):
         return 1
 
-    # 构造消息——发给 OpenClaw，让它按 AGENTS.md 规则处理
+    # 构造消息——交给 harness 后面的 Agent，让它按项目规则处理
     content = _resolve_input(args.input)
 
     message = f"{persona_prefix(args.profile)}请执行 /{skill_full}，内容如下：\n\n{content}"
@@ -168,4 +155,4 @@ def cmd_skill(args) -> int:
         print(f"[easel] 画像: {args.profile}")
     print("─" * 50)
 
-    return _run_via_openclaw(message, timeout=timeout)
+    return _run_via_harness(message, timeout=timeout)

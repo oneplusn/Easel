@@ -35,6 +35,7 @@ if str(PROJECT_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from easel.openclaw_cmd import openclaw_base_cmd
+from easel.harness import HarnessError, RunSpec, get_harness
 from easel.persona import load_profile_text, persona_prefix, chat_turn_message, profile_exists, _FILE_ORDER
 from easel.timeouts import TIMEOUT_CHAT, TIMEOUT_DIRECT, TIMEOUT_PRODUCE
 try:
@@ -610,22 +611,32 @@ def _api_spec_status(skill: str, env: dict[str, str]) -> dict:
 
 
 def run_agent_sync(msg: str, timeout: int = TIMEOUT_DIRECT, session_id: str | None = None) -> str:
+    """非流式跑一轮：走当前 harness（默认 openjiuwen；``EASEL_HARNESS=openclaw`` 可回退）。
+
+    返回串契约与改造前一致（调用方直接展示这段文本）。
+    """
     sk = session_id or f'web-{int(time.time() * 1000)}'
-    _heal_openclaw_session(sk)   # 清洗历史里无签名 thinking 块，防回放失效
-    # 钉死 --session-id 让 OpenClaw 每轮续同一 transcript（防跨天空闲后新起空会话丢历史，见 _openclaw_session_id）
-    cmd = openclaw_base_cmd() + ['--profile', OPENCLAW_PROFILE, 'agent', '--agent', 'main',
-           '--session-key', f'agent:main:{sk}', '--session-id', _openclaw_session_id(sk),
-           '--thinking', THINKING_LEVEL,
-           '--timeout', str(timeout), '--message', msg]
-    # 跨进程锁：同一会话同时刻只跑一个 openclaw，防并发 takeover 崩溃（rc=1）
+    _heal_openclaw_session(sk)   # 清洗历史里无签名 thinking 块，防回放失效（仅 openclaw 路径需要，对 openjiuwen 无副作用）
+    # 跨进程锁：同一会话同时刻只跑一个后端进程，防并发 takeover 崩溃（rc=1）
     xlock = _CrossProcLock(sk)
     if not xlock.acquire(timeout=min(timeout, 300)):
         return '⏳ 这个会话正在另一个窗口运行，请稍候再试'
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=timeout + 30, env=_proxy_env())
-        return clean_agent_output(r.stdout or '') or '（无输出）'
-    except subprocess.TimeoutExpired:
-        return '⏱️ 请求超时'
+        # session_key 交给 harness 组装（OpenClaw 侧自己加 agent:main: 前缀）；session-id
+        # 用同一 uuid5 命名空间推导，与改造前的 _openclaw_session_id(sk) 同值。
+        result = get_harness().run_sync(RunSpec(
+            message=msg,
+            session_key=sk,
+            cwd=PROJECT_ROOT,
+            timeout_s=float(timeout),
+            env=_proxy_env(),
+        ))
+        return (result.text or '').strip() or '（无输出）'
+    except HarnessError as e:
+        text = str(e)
+        if '超时' in text or 'timeout' in text.lower():
+            return '⏱️ 请求超时'
+        return f'❌ {text}'
     except Exception as e:
         return f'❌ {e}'
     finally:
@@ -1149,6 +1160,50 @@ _BG_TASKS: set = set()
 
 # 正在跑的对话 openclaw 进程（sk→proc），供用户**显式「停止」**终止；断线**不**经此路径（断线不杀）。
 _RUNNING_CHAT: dict = {}
+#: Web 主对话链路流式后端开关：默认走 harness（默认 harness=openjiuwen）；
+#: ``EASEL_STREAM_BACKEND=openclaw`` 时回退到旧路（openclaw argv + gateway 共享 raw-stream tail）。
+STREAM_BACKEND = (os.environ.get("EASEL_STREAM_BACKEND", "").strip().lower() or "harness")
+#: 同上，但用于「真流式」而非后端名；doctor/诊断页可读
+HARNESS_STREAM_ENABLED = False
+
+
+def _harness_stream_enabled() -> bool:
+    """本轮是否用 harness 驱动流式。任何异常都退回旧路径，不让新链路拖垮主站。"""
+    global HARNESS_STREAM_ENABLED
+    if STREAM_BACKEND == "openclaw":
+        return False
+    try:
+        ok = bool(get_harness().describe().get("streaming"))
+    except Exception:
+        ok = False
+    HARNESS_STREAM_ENABLED = ok
+    return ok
+
+
+class _HarnessRunHandle:
+    """把 harness 的一轮流式跑包装成与 ``subprocess.Popen`` 相近的句柄。
+
+    ``/api/chat/stop`` 只用到 ``poll() / terminate() / wait()``，这里按同样语义映射到
+    asyncio Task 的取消上——没有子进程可杀，取消即中断本轮（supervisor 照常落盘收尾）。
+    """
+
+    def __init__(self, task: "asyncio.Task") -> None:
+        self._task = task
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        if self._task.done():
+            self.returncode = 1 if self._task.cancelled() else 0
+        return self.returncode
+
+    def terminate(self) -> None:
+        self._task.cancel()
+
+    def kill(self) -> None:
+        self._task.cancel()
+
+    def wait(self, timeout: float | None = None):  # noqa: ARG002 - 与 Popen.wait 同形
+        return self.returncode
 # 被用户显式停止的会话 key：supervisor 据此把本轮当作正常「已停止」收尾（不报「被中断」、释放会话锁）。
 _STOPPED_CHAT: set = set()
 
@@ -1256,6 +1311,86 @@ async def api_chat_stream(req: ChatRequest):
             except OSError:
                 pass
             client_q.put_nowait({"t": kind, "text": text, "id": event_seq, **extra})
+
+        async def _run_harness_turn() -> None:
+            """本轮流式由 harness（openjiuwen SDK）驱动：无子进程、无 raw-stream tail。
+
+            事件语义与 SSE 名一一对应（token/thinking/activity/error），前端契约不变；
+            客户端断线仍不取消本轮（supervisor 是独立后台任务），结果照常落盘，
+            前端可用 /api/chat/last 取回完整回答。
+            """
+            harness = get_harness()
+            stop_reason = "end_turn"
+
+            def on_event(event) -> None:
+                kind = event.kind.value
+                if not event.text:
+                    return
+                if kind == "token":
+                    full_text.append(event.text)
+                    to_client("token", event.text)
+                elif kind == "thinking":
+                    to_client("thinking", event.text)
+                elif kind == "activity":
+                    to_client("activity", event.text)
+                elif kind == "error":
+                    to_client("error", event.text)
+
+            to_client("activity", "🧠 正在思考…")
+            run_task = asyncio.create_task(harness.run(
+                RunSpec(
+                    message=message,
+                    session_key=f"web:{sk}",
+                    cwd=PROJECT_ROOT,
+                    timeout_s=float(TIMEOUT_CHAT),
+                    env=_proxy_env(),
+                ),
+                on_event=on_event,
+            ))
+            _RUNNING_CHAT[sk] = _HarnessRunHandle(run_task)
+            try:
+                result = await run_task
+                stop_reason = result.stop_reason or "end_turn"
+            except asyncio.CancelledError:
+                stop_reason = "user_stopped"
+            except HarnessError as exc:
+                to_client("error", f"❌ {exc}")
+                stop_reason = "harness_error"
+            except Exception as exc:  # noqa: BLE001
+                to_client("error", f"❌ {exc}")
+                stop_reason = "harness_error"
+            finally:
+                _RUNNING_CHAT.pop(sk, None)
+                _save_turn(pk, "done", "".join(full_text), {
+                    "turn_id": turn_id,
+                    "clean_end": stop_reason == "end_turn",
+                    "stop_reason": stop_reason,
+                })
+                xlock.release()
+                lock.release()
+                to_client("done", sessionKey=sk)
+
+        if _harness_stream_enabled():
+            # 走 harness 时不碰任何 openclaw 专属准备（argv 组装 / raw-stream tail /
+            # gateway 问答题桥接）——那些在本机没有 openclaw 时会直接抛错。
+            lock = _session_lock(sk)
+            xlock = _CrossProcLock(sk)
+            if lock.locked():
+                to_client("activity", "⏳ 这个会话上一条还在跑，排队等它结束再开始…")
+            await lock.acquire()
+            got = await loop.run_in_executor(None, xlock.acquire, min(TIMEOUT_CHAT, 300))
+            if not got:
+                lock.release()
+                _save_turn(pk, "done", "这个会话正在另一个窗口运行，请稍候再试。", {
+                    "turn_id": turn_id, "clean_end": False, "stop_reason": "session_lock_timeout",
+                })
+                to_client("activity", "⏳ 这个会话正在另一个窗口运行，请稍候再试")
+                to_client("done", sessionKey=sk)
+                client_q.put_nowait(CLIENT_DONE)
+                return
+            await _run_harness_turn()
+            client_q.put_nowait(CLIENT_DONE)
+            return
 
         _heal_openclaw_session(sk)       # 清洗历史里无签名 thinking 块，防回放失效
         # 原始事件流由常驻 gateway 写到共享文件（见 SHARED_RAW_STREAM / scripts/gateway.sh），
